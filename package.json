@@ -1,12 +1,13 @@
 {
   "name": "video-processor-backend",
   "version": "1.0.0",
-  "description": "Simple video to zip processing service",
+  "description": "Advanced job-based video and zip processor",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.14",
     "archiver": "^6.0.1",
     "cors": "^2.8.5",
     "express": "^4.19.2",
