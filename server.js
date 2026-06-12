@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const ffmpegPath = require('ffmpeg-static'); // 1. Import the static binary path
+const ffmpegPath = require('ffmpeg-static');
 const ffmpeg = require('fluent-ffmpeg');
 const archiver = require('archiver');
 const AdmZip = require('adm-zip');
@@ -9,17 +9,31 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
-// 2. Point fluent-ffmpeg to the static binary location
-ffmpeg.setFfmpegPath(ffmpegPath); 
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const upload = multer({ dest: os.tmpdir() });
-
-// In-memory global store to hold the state of running jobs
 const jobs = {};
+
+// --- HELPER: ASSET SCANNER ---
+// Recursively finds all images and audio files no matter what folders they are hidden in
+function findAssets(dir, pngs = [], audios = []) {
+    const items = fs.readdirSync(dir);
+    for (const item of items) {
+        const fullPath = path.join(dir, item);
+        if (fs.statSync(fullPath).isDirectory()) {
+            findAssets(fullPath, pngs, audios);
+        } else {
+            const lower = fullPath.toLowerCase();
+            if (lower.endsWith('.png')) pngs.push(fullPath);
+            if (lower.match(/\.(wav|mp3)$/)) audios.push(fullPath);
+        }
+    }
+    return { pngs, audios };
+}
 
 // --- ENDPOINT 1: VIDEO TO ZIP ---
 app.post('/process-video', upload.single('video'), (req, res) => {
@@ -34,11 +48,11 @@ app.post('/process-video', upload.single('video'), (req, res) => {
     fs.mkdirSync(outputFolder, { recursive: true });
 
     jobs[jobId] = { status: 'processing', stage: 'Slicing frames', progress: 0, fileToDelete: zipPath, originalName: req.file.originalname };
-    res.json({ jobId }); // Hand back the tracking ticket instantly
+    res.json({ jobId });
 
     ffmpeg(videoPath)
         .fps(fps)
-        .output(path.join(outputFolder, 'frame-%05d.png'))
+        .output(path.join(outputFolder, 'img-%05d.png'))
         .output(path.join(outputFolder, 'audio.wav'))
         .on('progress', (progress) => {
             if (jobs[jobId]) jobs[jobId].progress = Math.min(95, Math.round(progress.percent || 0));
@@ -63,7 +77,7 @@ app.post('/process-video', upload.single('video'), (req, res) => {
             archive.finalize();
         })
         .on('error', (err) => {
-            console.error(err);
+            console.error("FFmpeg Extract Error:", err);
             if (jobs[jobId]) jobs[jobId].status = 'failed';
             cleanupDir(videoPath, outputFolder);
         })
@@ -86,32 +100,50 @@ app.post('/process-zip', upload.single('zip'), (req, res) => {
     try {
         const zip = new AdmZip(zipPath);
         zip.extractAllTo(extractFolder, true);
-        fs.unlinkSync(zipPath); // Delete raw uploaded zip early
+        fs.unlinkSync(zipPath);
 
-        const files = fs.readdirSync(extractFolder);
-        const totalFrames = files.filter(f => f.endsWith('.png')).length;
+        jobs[jobId].stage = 'Normalizing file structures';
 
-        if (totalFrames === 0) {
+        // Find all scattered assets and bring them to the root
+        const { pngs, audios } = findAssets(extractFolder);
+        
+        // Sort alphabetically to maintain original frame sequence
+        pngs.sort();
+
+        if (pngs.length === 0) {
+            console.error("No PNG frames found inside the uploaded ZIP.");
             jobs[jobId].status = 'failed';
             return cleanupDir(null, extractFolder);
+        }
+
+        // Rename all images to a strict sequential format (seq-00001.png, seq-00002.png...)
+        pngs.forEach((oldPath, index) => {
+            const newPath = path.join(extractFolder, `seq-${String(index + 1).padStart(5, '0')}.png`);
+            fs.renameSync(oldPath, newPath);
+        });
+
+        // Handle Audio
+        let targetAudioPath = null;
+        if (audios.length > 0) {
+            targetAudioPath = path.join(extractFolder, 'main_audio.wav');
+            fs.renameSync(audios[0], targetAudioPath);
         }
 
         jobs[jobId].stage = 'Compiling video track';
 
         let command = ffmpeg()
-            .input(path.join(extractFolder, 'frame-%05d.png'))
+            .input(path.join(extractFolder, 'seq-%05d.png'))
             .inputOptions([`-framerate ${fps}`]);
 
-        // Check if an audio file exists in the package
-        if (fs.existsSync(path.join(extractFolder, 'audio.wav'))) {
-            command.input(path.join(extractFolder, 'audio.wav'));
+        if (targetAudioPath) {
+            command.input(targetAudioPath);
         }
 
         command.output(videoOutputPath)
             .outputOptions(['-c:v libx264', '-pix_fmt yuv420p', '-movflags +faststart'])
             .on('progress', (progress) => {
                 if (jobs[jobId]) {
-                    const pct = Math.round((progress.frames / totalFrames) * 100);
+                    const pct = Math.round((progress.frames / pngs.length) * 100);
                     jobs[jobId].progress = Math.min(99, pct || 0);
                 }
             })
@@ -123,7 +155,7 @@ app.post('/process-zip', upload.single('zip'), (req, res) => {
                 cleanupDir(null, extractFolder);
             })
             .on('error', (err) => {
-                console.error(err);
+                console.error("FFmpeg Compile Error:", err);
                 if (jobs[jobId]) jobs[jobId].status = 'failed';
                 cleanupDir(null, extractFolder);
                 if (fs.existsSync(videoOutputPath)) fs.unlinkSync(videoOutputPath);
@@ -131,8 +163,8 @@ app.post('/process-zip', upload.single('zip'), (req, res) => {
             .run();
 
     } catch (err) {
-        console.error(err);
-        jobs[jobId].status = 'failed';
+        console.error("Extraction/Normalization Error:", err);
+        if (jobs[jobId]) jobs[jobId].status = 'failed';
         cleanupDir(null, extractFolder);
     }
 });
@@ -154,7 +186,6 @@ app.get('/download/:id', (req, res) => {
     const attachmentName = isZip ? `${targetName}_assets.zip` : `${targetName}_rebuilt.mp4`;
 
     res.download(job.fileToDelete, attachmentName, () => {
-        // Immediate clean up from disk space after transaction drops
         if (fs.existsSync(job.fileToDelete)) fs.unlinkSync(job.fileToDelete);
         delete jobs[req.params.id];
     });
