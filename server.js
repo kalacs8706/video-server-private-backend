@@ -1,12 +1,16 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
+const ffmpegPath = require('ffmpeg-static'); // 1. Import the static binary path
 const ffmpeg = require('fluent-ffmpeg');
 const archiver = require('archiver');
 const AdmZip = require('adm-zip');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+
+// 2. Point fluent-ffmpeg to the static binary location
+ffmpeg.setFfmpegPath(ffmpegPath); 
 
 const app = express();
 app.use(cors());
